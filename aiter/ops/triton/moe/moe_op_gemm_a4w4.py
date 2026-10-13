@@ -25,6 +25,13 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
+GLUON_SUPPORTED_ARCHS = {"gfx1250"}
+
+
+def is_gluon_supported():
+    arch = get_arch()
+    return arch in GLUON_SUPPORTED_ARCHS
+
 
 @functools.lru_cache
 def _get_a4w4_dispatch(arch: str) -> dict:
@@ -264,7 +271,7 @@ def moe_gemm_a4w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    backend=None,
+    backend=None,  # "triton" | "gluon"
 ):
     """
     Y[:, :] = 0.
@@ -272,17 +279,18 @@ def moe_gemm_a4w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
-    assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
+        # default to gluon backend if supported
+        backend = "gluon" if is_gluon_supported() else "triton"
+    assert backend in ["triton", "gluon"], f"Invalid backend: {backend}"
     if backend == "gluon":
+        # make sure gluon backend is supported on this architecture
         assert (
-            get_arch() == "gfx1250"
-        ), f"Gluon backend requires gfx1250, got {get_arch()}"
+            is_gluon_supported()
+        ), f"Gluon backend is not supported on this architecture: {get_arch()}"
     use_gluon = backend == "gluon"
+
     if preshuffle_weights:
-        assert (
-            use_gluon
-        ), "preshuffled weights are only supported by the gluon (gfx1250) kernel"
+        assert use_gluon, "Preshuffled weights are only supported on gluon backend"
 
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
@@ -364,7 +372,7 @@ def moe_gemm_a4w4(
     grid = grid_m * grid_n * split_k
 
     # launch kernel
-    if use_gluon and block_m == 16:
+    if use_gluon and get_arch() == "gfx1250" and block_m == 16:
         layouts = get_moe_a4w4_layouts_decode(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
@@ -427,7 +435,7 @@ def moe_gemm_a4w4(
             **layouts,
             num_warps=config["num_warps"],
         )
-    elif use_gluon:
+    elif use_gluon and get_arch() == "gfx1250":
         # layouts
         layouts = get_moe_a4w4_layouts_prefill(
             BLOCK_M=config["block_m"],

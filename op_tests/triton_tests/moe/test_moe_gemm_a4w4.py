@@ -10,6 +10,7 @@ from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     moe_gemm_a4w4,
     moe_gemm_torch,
     mxfp4_quant,
@@ -240,7 +241,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("backend", ["gluon", "triton"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -256,13 +257,8 @@ def test_op(
     backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950" and get_arch() != "gfx1250":
-        pytest.skip("Kernel not supported on this GPU.")
     if not is_fp4_avail():
         pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
-
-    if backend == "gluon" and get_arch() != "gfx1250":
-        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
@@ -278,13 +274,17 @@ def test_op(
     if preshuffle_weights:
         if get_arch() != "gfx1250":
             pytest.skip("Preshuffling weights is only supported on gfx1250")
-        if backend == "triton":
-            pytest.skip("Preshuffled weights are decoded by the gluon kernel only")
+        if backend != "gluon":
+            pytest.skip("Preshuffling weights is only supported on gluon backend")
         if n % 16 != 0 or (k // 2) % 32 != 0:
             pytest.skip(
                 f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
                 f"by 32, got n={n}, k//2={k // 2}"
             )
+
+    # skip gluon backend if not supported
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
     torch.manual_seed(0)
 

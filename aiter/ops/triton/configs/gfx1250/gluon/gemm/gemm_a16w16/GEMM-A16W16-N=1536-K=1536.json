@@ -36,6 +36,15 @@
         "kernel_type": "bandwidth_bound",
         "waves_per_eu": 1
     },
+    "M_LEQ_32": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 6,
+        "num_warps": 4,
+        "kernel_type": "bandwidth_bound",
+        "waves_per_eu": 1
+    },
     "any": {
         "BLOCK_M": 128,
         "BLOCK_N": 128,

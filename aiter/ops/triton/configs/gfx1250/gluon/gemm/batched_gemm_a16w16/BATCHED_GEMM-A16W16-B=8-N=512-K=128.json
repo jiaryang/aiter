@@ -66,6 +66,17 @@
         "cache_modifier": ".cg",
         "kernel_type": "bandwidth_bound"
     },
+    "M_LEQ_128": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "num_warps": 2,
+        "NUM_BUFFERS": 2,
+        "waves_per_eu": 4,
+        "NUM_KSPLIT": 1,
+        "cache_modifier": ".cg",
+        "kernel_type": "bandwidth_bound"
+    },
     "any": {
         "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 32,

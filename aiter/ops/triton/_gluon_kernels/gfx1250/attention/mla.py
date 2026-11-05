@@ -2554,7 +2554,36 @@ def _mla_decode_fwd_kernel(
                 scales_dtype=e4m3_dtype,
             )
         else:
-            kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
+            # The shared tile was loaded without a seq_len mask. Reload this
+            # last tile from global with other=0 so a NaN tail cannot reach
+            # wmma; the score mask leaves P = 0, and 0 * NaN is NaN.
+            # V's dot layout cannot hold that row mask.
+            V_MASK_LAYOUT: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 8],
+                threads_per_warp=[1, 32],
+                warps_per_cta=[num_warps, 1],
+                order=[1, 0],
+            )
+            offs_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(1, V_MASK_LAYOUT))
+            offs_d = gl.arange(
+                0, KV_LORA_RANK, layout=gl.SliceLayout(0, V_MASK_LAYOUT)
+            )
+            kv_offset = (
+                physical_block_idx.to(gl.int64) * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+            )
+            kv_lora_offset = (
+                kv_offset
+                + offs_t[:, None] * stride_kv_buffer_1
+                + offs_d[None, :] * stride_kv_buffer_3
+            )
+            tok = (pgm.tile_end - 1) * TILE_SIZE + offs_t
+            kv_lora_load = gl.load(
+                kv_buffer_ptr + kv_lora_offset,
+                mask=tok[:, None] < seq_len,
+                other=0.0,
+            )
+            kv_lora_trans = gl.convert_layout(kv_lora_load, cfg.V_DOT_LAYOUT)
             acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
     # if kv_scale_ptr is not None:
@@ -2922,9 +2951,13 @@ def _mla_prefill_fwd_kernel_non_pipelined(
             + offs_kv_t_lora[:, None] * stride_kv_buffer_1
             + offs_kv_d_lora[None, :] * stride_kv_buffer_3
         )
-        # KV_lora : (BLOCK_M, KV_LORA_RANK)
+        # KV_lora : (BLOCK_M, KV_LORA_RANK). Rows past seq_len are 0 so a NaN
+        # tail cannot reach wmma(P, V); the score mask alone leaves 0 * NaN.
+        kv_token = j * TILE_SIZE + offs_kv_t_lora
         KV_lora_load = gl.load(
             kv_buffer_ptr + kv_lora_offset,
+            mask=kv_token[:, None] < seq_len,
+            other=0.0,
             cache_modifier=cfg.kv_cache_modifier,
         )
         kv_lora_shared.store(KV_lora_load)
@@ -3346,9 +3379,13 @@ def _mla_decode_fwd_kernel_non_pipelined(
             + offs_kv_t_lora[:, None] * stride_kv_buffer_1
             + offs_kv_d_lora[None, :] * stride_kv_buffer_3
         )
-        # KV_lora : (BLOCK_M, KV_LORA_RANK)
+        # KV_lora : (BLOCK_M, KV_LORA_RANK). Rows past seq_len are 0 so a NaN
+        # tail cannot reach wmma(P, V); the score mask alone leaves 0 * NaN.
+        kv_token = j * TILE_SIZE + offs_kv_t_lora
         KV_lora_load = gl.load(
             kv_buffer_ptr + kv_lora_offset,
+            mask=kv_token[:, None] < seq_len,
+            other=0.0,
             cache_modifier=cfg.kv_cache_modifier,
         )
         kv_lora_shared.store(KV_lora_load)

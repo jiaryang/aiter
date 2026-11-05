@@ -1126,6 +1126,40 @@ class MLAProgram:
             )
 
     @gluon.jit
+    def tdm_load_global_to_shared_kv_lora_tile(
+        self, row_offsets, buffer_id, tile_idx, seq_len
+    ):
+        # On the unshuffled layout the descriptor ends at seq_len, so TDM fills
+        # the unused tail of the last block with zero. A NaN there would
+        # otherwise reach wmma(P, V): the score mask leaves P = 0, and 0 * NaN
+        # is NaN. Shuffled pages put heads between tokens, so they load whole.
+        cfg = self.cfg
+        if not cfg.SHUFFLED_KV_CACHE and cfg.KV_CACHE_DTYPE != "nvfp4":
+            kv_row_size: gl.constexpr = cfg.NUM_KV_HEADS * (
+                cfg.KV_LORA_RANK + cfg.QK_ROPE_HEAD_DIM
+            )
+            num_valid_rows = gl.minimum(
+                seq_len - tile_idx * cfg.TILE_SIZE, cfg.TILE_SIZE
+            )
+            desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=self.kv_buffer_ptr,
+                shape=(row_offsets + num_valid_rows, kv_row_size),
+                strides=(self.stride_kv_buffer_1, 1),
+                block_shape=(cfg.BLOCK_SIZE, cfg.KV_LORA_RANK),
+                layout=cfg.KV_LORA_SHARED_LAYOUT,
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                desc,
+                [
+                    row_offsets,
+                    (self.kv_head_idx * self.stride_kv_buffer_2).to(gl.int32),
+                ],
+                self.kv_lora_shared.index(buffer_id),
+            )
+        else:
+            self.tdm_load_global_to_shared_kv_lora(row_offsets, buffer_id)
+
+    @gluon.jit
     def tdm_load_global_to_shared_k_rope(self, row_offsets, buffer_id):
         if self.cfg.SHUFFLED_KV_CACHE:
             offsets = [row_offsets, 0]
@@ -1655,6 +1689,7 @@ class MLAProgram:
         acc,
         fill_row,
         fill_slot,
+        fill_tile_idx,
         LORA_WAIT: gl.constexpr,
         ROPE_WAIT: gl.constexpr,
         FILL: gl.constexpr,
@@ -1669,7 +1704,9 @@ class MLAProgram:
         k_lora = self.tdm_shared_load_kv_lora(LORA_WAIT, buffer_id)
         S = self.compute_qk_lora(k_lora, None, None, S)
         if FILL:
-            self.tdm_load_global_to_shared_kv_lora(fill_row, fill_slot)
+            self.tdm_load_global_to_shared_kv_lora_tile(
+                fill_row, fill_slot, fill_tile_idx, seq_len
+            )
             self.tdm_load_global_to_shared_k_rope(fill_row, fill_slot)
         k_rope = self.tdm_shared_load_k_rope(ROPE_WAIT, buffer_id)
         S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
@@ -1900,7 +1937,9 @@ def _mla_decode_kv_ring(
             prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
         )
         row = pgm.get_kv_buffer_row_offsets(page)
-        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
+        pgm.tdm_load_global_to_shared_kv_lora_tile(
+            row, prime, pgm.tile_start + gl.minimum(prime, num_tiles - 1), seq_len
+        )
         pgm.tdm_load_global_to_shared_k_rope(row, prime)
 
     L, M, acc = pgm.allocate_accumulator()
@@ -1925,6 +1964,7 @@ def _mla_decode_kv_ring(
             acc,
             row,
             fill_slot,
+            pgm.tile_start + tile + PREFETCH,
             LORA_WAIT=2 * PREFETCH - 1,
             ROPE_WAIT=2 * PREFETCH,
             FILL=True,
@@ -1945,6 +1985,7 @@ def _mla_decode_kv_ring(
                 L,
                 M,
                 acc,
+                0,
                 0,
                 0,
                 LORA_WAIT=2 * (PREFETCH - k) - 1,
@@ -2424,10 +2465,12 @@ def _mla_decode_fwd_kernel(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
         row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-        pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
+        pgm.tdm_load_global_to_shared_kv_lora_tile(
+            row_offsets, 0, pgm.tile_start, seq_len
+        )
         pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
-        for _ in range(pgm.tile_start, pgm.tile_end - 1):
+        for j in range(pgm.tile_start, pgm.tile_end - 1):
             physical_block_idx = next_physical_block_idx
             j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
                 j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
@@ -2451,7 +2494,9 @@ def _mla_decode_fwd_kernel(
 
             next_buffer_id = pgm.get_next_buffer_id(buffer_id)
             row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
+            pgm.tdm_load_global_to_shared_kv_lora_tile(
+                row_offsets, next_buffer_id, j + 1, seq_len
+            )
             pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
 
             if KV_CACHE_DTYPE == "nvfp4":
